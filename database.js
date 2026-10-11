@@ -70,67 +70,61 @@ function saveDatabase() {
     }
 }
 
-// Экранирование SQL-строки
-function escapeSql(str) {
-    if (str === null || str === undefined) return '';
-    return String(str).replace(/'/g, "''");
+// Выполнение запроса с параметрами (без подстановки значений в строку SQL)
+function run(sql, params = []) {
+    db.run(sql, params);
+}
+
+// Выборка строк в виде массива объектов
+function all(sql, params = []) {
+    const stmt = db.prepare(sql);
+    try {
+        stmt.bind(params);
+        const rows = [];
+        while (stmt.step()) rows.push(stmt.getAsObject());
+        return rows;
+    } finally {
+        stmt.free();
+    }
+}
+
+function get(sql, params = []) {
+    return all(sql, params)[0] || null;
+}
+
+// Положительное целое число или ошибка
+function toPositiveInt(value) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n <= 0) {
+        throw new Error('Notoʻgʻri miqdor');
+    }
+    return n;
 }
 
 // Поиск пользователя по ID
 function getUser(userId) {
-    const safeId = parseInt(userId) || 0;
-    const result = db.exec(`SELECT * FROM users WHERE id = ${safeId}`);
-    
-    if (result.length === 0 || result[0].values.length === 0) {
-        return null;
-    }
-    
-    const row = result[0].values[0];
-    const columns = result[0].columns;
-    const user = {};
-    columns.forEach((col, idx) => {
-        user[col] = row[idx];
-    });
-    return user;
+    return get('SELECT * FROM users WHERE id = ?', [parseInt(userId) || 0]);
 }
 
 // Поиск пользователя по Email / Номеру
 function getUserByIdentifier(identifier) {
-    const safeId = escapeSql(identifier.trim().toLowerCase());
-    const result = db.exec(`SELECT * FROM users WHERE identifier = '${safeId}'`);
-    
-    if (result.length === 0 || result[0].values.length === 0) {
-        return null;
-    }
-    
-    const row = result[0].values[0];
-    const columns = result[0].columns;
-    const user = {};
-    columns.forEach((col, idx) => {
-        user[col] = row[idx];
-    });
-    return user;
+    return get('SELECT * FROM users WHERE identifier = ?', [String(identifier).trim().toLowerCase()]);
 }
 
 // Создание пользователя
 function createUser(identifier, name, hashedPassword, initialCoins = 15) {
-    const safeId = escapeSql(identifier.trim().toLowerCase());
-    const safeName = escapeSql(name);
-    const safePass = escapeSql(hashedPassword);
-    
-    db.run(`
-        INSERT INTO users (identifier, name, password, coins, total_purchased) 
-        VALUES ('${safeId}', '${safeName}', '${safePass}', ${initialCoins}, ${initialCoins})
-    `);
-    
-    const lastIdResult = db.exec("SELECT last_insert_rowid()");
-    const newId = lastIdResult[0].values[0][0];
-    
-    db.run(`
-        INSERT INTO transactions (user_id, type, amount, description) 
-        VALUES (${newId}, 'bonus', ${initialCoins}, 'Roʻyxatdan oʻtish bonusi (+15 tanga)')
-    `);
-    
+    run(
+        'INSERT INTO users (identifier, name, password, coins, total_purchased) VALUES (?, ?, ?, ?, ?)',
+        [String(identifier).trim().toLowerCase(), name, hashedPassword, initialCoins, initialCoins]
+    );
+
+    const newId = db.exec('SELECT last_insert_rowid()')[0].values[0][0];
+
+    run(
+        "INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'bonus', ?, ?)",
+        [newId, initialCoins, 'Roʻyxatdan oʻtish bonusi (+15 tanga)']
+    );
+
     saveDatabase();
     return getUser(newId);
 }
@@ -144,49 +138,35 @@ function getBalance(userId) {
 // Добавить монеты
 function addCoins(userId, amount, description = 'Пополнение баланса') {
     const safeId = parseInt(userId) || 0;
-    const safeAmount = parseInt(amount) || 0;
-    const safeDescription = escapeSql(description);
-    
-    db.run(`UPDATE users SET coins = coins + ${safeAmount}, total_purchased = total_purchased + ${safeAmount} WHERE id = ${safeId}`);
-    db.run(`INSERT INTO transactions (user_id, type, amount, description) VALUES (${safeId}, 'purchase', ${safeAmount}, '${safeDescription}')`);
+    const safeAmount = toPositiveInt(amount);
+
+    run('UPDATE users SET coins = coins + ?, total_purchased = total_purchased + ? WHERE id = ?', [safeAmount, safeAmount, safeId]);
+    run("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'purchase', ?, ?)", [safeId, safeAmount, description]);
     saveDatabase();
-    
+
     return getBalance(safeId);
 }
 
 // Списать монеты
 function spendCoins(userId, amount, description = 'Оплата услуги') {
     const safeId = parseInt(userId) || 0;
-    const safeAmount = parseInt(amount) || 0;
-    const safeDescription = escapeSql(description);
-    
+    const safeAmount = toPositiveInt(amount);
+
     const user = getUser(safeId);
     if (!user || user.coins < safeAmount) {
         throw new Error('Недостаточно монет');
     }
-    
-    db.run(`UPDATE users SET coins = coins - ${safeAmount}, total_spent = total_spent + ${safeAmount} WHERE id = ${safeId}`);
-    db.run(`INSERT INTO transactions (user_id, type, amount, description) VALUES (${safeId}, 'spend', ${safeAmount}, '${safeDescription}')`);
+
+    run('UPDATE users SET coins = coins - ?, total_spent = total_spent + ? WHERE id = ?', [safeAmount, safeAmount, safeId]);
+    run("INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'spend', ?, ?)", [safeId, safeAmount, description]);
     saveDatabase();
-    
+
     return getBalance(safeId);
 }
 
 // Получить историю транзакций
 function getTransactions(userId, limit = 20) {
-    const safeId = parseInt(userId) || 0;
-    const result = db.exec(`SELECT * FROM transactions WHERE user_id = ${safeId} ORDER BY id DESC LIMIT ${limit}`);
-    
-    if (result.length === 0) return [];
-    
-    const columns = result[0].columns;
-    return result[0].values.map(row => {
-        const obj = {};
-        columns.forEach((col, idx) => {
-            obj[col] = row[idx];
-        });
-        return obj;
-    });
+    return all('SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT ?', [parseInt(userId) || 0, parseInt(limit) || 20]);
 }
 
 // Получить статистику
@@ -195,19 +175,43 @@ function getStats(userId) {
     if (!user) {
         return { coins: 0, totalSpent: 0, totalPurchased: 0, totalTransactions: 0 };
     }
-    
-    let totalTransactions = 0;
-    const txResult = db.exec(`SELECT COUNT(*) as count FROM transactions WHERE user_id = ${userId}`);
-    if (txResult.length > 0 && txResult[0].values.length > 0) {
-        totalTransactions = txResult[0].values[0][0];
-    }
-    
+
+    const row = get('SELECT COUNT(*) AS count FROM transactions WHERE user_id = ?', [user.id]);
+
     return {
         coins: user.coins,
         totalSpent: user.total_spent,
         totalPurchased: user.total_purchased,
-        totalTransactions: totalTransactions
+        totalTransactions: row ? row.count : 0
     };
+}
+
+// ============================================================
+// Заказы (P2P платежи)
+// ============================================================
+function createOrder(orderId, userId, packageId, amount, coins) {
+    run(
+        "INSERT INTO orders (order_id, user_id, package_id, amount, coins, status, created_at) VALUES (?, ?, ?, ?, ?, 'PENDING', datetime('now'))",
+        [orderId, userId, packageId, amount, coins]
+    );
+    saveDatabase();
+}
+
+function getOrder(orderId) {
+    return get('SELECT * FROM orders WHERE order_id = ?', [String(orderId)]);
+}
+
+// Самый свежий ожидающий заказ на сумму в диапазоне [min, max] за последние N минут
+function findPendingOrder(minAmount, maxAmount, minutes) {
+    return get(
+        "SELECT * FROM orders WHERE amount BETWEEN ? AND ? AND status = 'PENDING' AND datetime(created_at) >= datetime('now', ?) ORDER BY id DESC LIMIT 1",
+        [minAmount, maxAmount, `-${parseInt(minutes)} minutes`]
+    );
+}
+
+function markOrderPaid(id) {
+    run("UPDATE orders SET status = 'PAID' WHERE id = ?", [id]);
+    saveDatabase();
 }
 
 module.exports = {
@@ -220,5 +224,8 @@ module.exports = {
     spendCoins,
     getTransactions,
     getStats,
-    db // Экспортируем объект базы данных для сервера
+    createOrder,
+    getOrder,
+    findPendingOrder,
+    markOrderPaid
 };
