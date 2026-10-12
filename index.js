@@ -28,6 +28,9 @@ if (!JWT_SECRET) {
 
 const SMS_WEBHOOK_SECRET = process.env.SMS_WEBHOOK_SECRET;
 
+// Сколько минут заказ ждёт оплату (на фронтенде таймер 10 минут + запас на задержку SMS)
+const ORDER_TTL_MINUTES = 15;
+
 // Tanga paketlari: narx va tangalar faqat serverda belgilanadi
 const COIN_PACKAGES = {
     pkg_15: { price: 7990, coins: 15 },
@@ -50,7 +53,7 @@ const {
     getStats,
     createOrder,
     getOrder,
-    findPendingOrder,
+    findPendingOrders,
     markOrderPaid
 } = require('./database');
 
@@ -321,11 +324,24 @@ app.post('/api/payment/create-order', requireAuth, (req, res) => {
             return res.status(400).json({ error: 'Paket topilmadi' });
         }
 
-        const orderId = `ord_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-        createOrder(orderId, req.userId, packageId, pkg.price, pkg.coins);
+        // Уникальная сумма: цена пакета минус 1–99 сум, не занятая другим активным заказом
+        const taken = new Set(
+            findPendingOrders(pkg.price - 99, pkg.price - 1, ORDER_TTL_MINUTES).map(o => o.amount)
+        );
+        const free = [];
+        for (let discount = 1; discount <= 99; discount++) {
+            if (!taken.has(pkg.price - discount)) free.push(pkg.price - discount);
+        }
+        if (free.length === 0) {
+            return res.status(503).json({ error: 'Hozir toʻlovlar koʻp, bir necha daqiqadan soʻng urinib koʻring' });
+        }
+        const amount = free[crypto.randomInt(free.length)];
 
-        console.log(`💳 Yangi buyurtma yaratildi: ${orderId} | Summa: ${pkg.price} so'm | Tanga: ${pkg.coins}`);
-        return res.json({ success: true, orderId, amount: pkg.price, coins: pkg.coins });
+        const orderId = `ord_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        createOrder(orderId, req.userId, packageId, amount, pkg.coins);
+
+        console.log(`💳 Yangi buyurtma yaratildi: ${orderId} | Summa: ${amount} so'm | Tanga: ${pkg.coins}`);
+        return res.json({ success: true, orderId, amount, coins: pkg.coins });
     } catch (error) {
         console.error('Create order error:', error);
         return res.status(500).json({ error: 'Buyurtma yaratishda xatolik' });
@@ -372,14 +388,19 @@ app.post('/api/webhook/sms', (req, res) => {
         const incomingAmount = parseInt(match[1], 10);
         console.log(`💰 Aniqlangan summa: ${incomingAmount} so'm`);
 
-        // Шаг 1: точное совпадение за последние 15 минут
-        let order = findPendingOrder(incomingAmount, incomingAmount, 15);
+        // Шаг 1: точное совпадение (суммы активных заказов уникальны)
+        let candidates = findPendingOrders(incomingAmount, incomingAmount, ORDER_TTL_MINUTES);
 
-        // Шаг 2: поиск по диапазону (+/- 100 сум) за последние 10 минут
-        if (!order) {
-            order = findPendingOrder(incomingAmount - 100, incomingAmount + 100, 10);
+        // Шаг 2: диапазон +/- 100 сум, но только если подходит ровно один заказ
+        if (candidates.length === 0) {
+            candidates = findPendingOrders(incomingAmount - 100, incomingAmount + 100, ORDER_TTL_MINUTES);
+            if (candidates.length > 1) {
+                console.log(`⚠️ ${incomingAmount} so'm: ${candidates.length} ta mos buyurtma, qoʻlda tekshiring`);
+                return res.status(409).json({ error: 'Bir nechta mos buyurtma, qoʻlda tekshirish kerak' });
+            }
         }
 
+        const order = candidates[0];
         if (!order) {
             console.log(`⚠️ Mos keluvchi faol buyurtma topilmadi (${incomingAmount} so'm)`);
             return res.status(404).json({ error: 'Mos buyurtma topilmadi' });

@@ -201,10 +201,10 @@ function getOrder(orderId) {
     return get('SELECT * FROM orders WHERE order_id = ?', [String(orderId)]);
 }
 
-// Самый свежий ожидающий заказ на сумму в диапазоне [min, max] за последние N минут
-function findPendingOrder(minAmount, maxAmount, minutes) {
-    return get(
-        "SELECT * FROM orders WHERE amount BETWEEN ? AND ? AND status = 'PENDING' AND datetime(created_at) >= datetime('now', ?) ORDER BY id DESC LIMIT 1",
+// Ожидающие заказы на сумму в диапазоне [min, max] за последние N минут
+function findPendingOrders(minAmount, maxAmount, minutes) {
+    return all(
+        "SELECT * FROM orders WHERE amount BETWEEN ? AND ? AND status = 'PENDING' AND datetime(created_at) >= datetime('now', ?) ORDER BY id DESC",
         [minAmount, maxAmount, `-${parseInt(minutes)} minutes`]
     );
 }
@@ -226,6 +226,6 @@ module.exports = {
     getStats,
     createOrder,
     getOrder,
-    findPendingOrder,
+    findPendingOrders,
     markOrderPaid
 };
