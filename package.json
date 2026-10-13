@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "test": "node --test test/sms-parser.test.js test/payments.test.js test/payments-expiry.test.js"
   },
   "keywords": [],
   "author": "",

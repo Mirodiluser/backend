@@ -17,22 +17,20 @@ const fs = require('fs');
 const os = require('os');
 const { exec, execSync } = require('child_process');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'tahrir_ai_jwt_secret_key_2026';
-
-const { 
-    initDatabase, 
-    getUser, 
-    getUserByIdentifier, 
-    createUser, 
-    getBalance, 
-    addCoins, 
-    spendCoins, 
-    getTransactions, 
-    getStats,
-    db // Импортируем объект БД для работы с заказами
+const {
+    initDatabase,
+    getUser,
+    getUserByIdentifier,
+    createUser,
+    getBalance,
+    spendCoins,
+    refundCoins,
+    getTransactions,
+    getStats
 } = require('./database');
+const { signToken, requireAuth, requireSelf } = require('./auth');
+const { createPaymentsRouter } = require('./payments');
 
 const { fixGrammar, transliterateWithAI } = require('./grammar');
 const { processDocxWithProgress } = require('./docxProcessor');
@@ -150,7 +148,7 @@ app.post('/api/auth/register', async (req, res) => {
         const displayName = name ? name.trim() : cleanId.split('@')[0];
 
         const newUser = createUser(cleanId, displayName, hashedPassword, 15);
-        const token = jwt.sign({ id: newUser.id }, JWT_SECRET, { expiresIn: '30d' });
+        const token = signToken(newUser.id);
 
         return res.json({
             success: true,
@@ -186,7 +184,7 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(400).json({ error: 'Notoʻgʻri parol' });
         }
 
-        const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '30d' });
+        const token = signToken(user.id);
 
         return res.json({
             success: true,
@@ -204,7 +202,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-app.get('/api/auth/me/:userId', (req, res) => {
+app.get('/api/auth/me/:userId', requireAuth, requireSelf, (req, res) => {
     try {
         const userId = parseInt(req.params.userId);
         if (!userId) return res.status(400).json({ error: 'ID kiritilmadi' });
@@ -225,115 +223,9 @@ app.get('/api/auth/me/:userId', (req, res) => {
 });
 
 // ============================================================
-// API: Платежи (Создание заказа, Статус, Вебхук SMS)
+// API: Платежи (создание заказа, статус, вебхук SMS) — см. payments.js
 // ============================================================
-
-// Yordamchi funksiya: sql.js natijasini obyektlar massiviga o'tkazish
-function queryToObjects(sqlQuery) {
-    const result = db.exec(sqlQuery);
-    if (result.length === 0) return [];
-    const columns = result[0].columns;
-    return result[0].values.map(row => {
-        const obj = {};
-        columns.forEach((col, idx) => { obj[col] = row[idx]; });
-        return obj;
-    });
-}
-
-// 1. Создание заказа на оплату
-app.post('/api/payment/create-order', (req, res) => {
-    try {
-        const { orderId, userId, packageId, amount, coins } = req.body;
-        if (!orderId || !userId || !amount || !coins) {
-            return res.status(400).json({ error: 'Maʼlumotlar yetarli emas' });
-        }
-
-        const pkgId = packageId || 'custom';
-        db.run(`
-            INSERT INTO orders (order_id, user_id, package_id, amount, coins, status, created_at)
-            VALUES ('${orderId}', ${userId}, '${pkgId}', ${amount},${coins}, 'PENDING', datetime('now'))
-        `);
-
-        console.log(`💳 Yangi buyurtma yaratildi: ${orderId} | Summa: ${amount} so'm \vert{} Tanga:${coins}`);
-        return res.json({ success: true, orderId });
-    } catch (error) {
-        console.error('Create order error:', error);
-        return res.status(500).json({ error: 'Buyurtma yaratishda xatolik' });
-    }
-});
-
-// 2. Проверка статуса заказа (для фронтенда в реальном времени)
-app.get('/api/payment/check-status/:orderId', (req, res) => {
-    try {
-        const { orderId } = req.params;
-        const orders = queryToObjects(`SELECT * FROM orders WHERE order_id = '${orderId}' LIMIT 1`);
-
-        if (orders.length === 0) {
-            return res.json({ status: 'PENDING' }); 
-        }
-
-        return res.json({ status: orders[0].status });
-    } catch (error) {
-        return res.status(500).json({ error: 'Server xatosi' });
-    }
-});
-
-// 3. Вебхук для приема SMS от телефона (Автоматическое зачисление + Диапазон + Умный поиск)
-app.post('/api/webhook/sms', (req, res) => {
-    try {
-        const { text } = req.body;
-        if (!text) return res.status(400).json({ error: 'SMS matni topilmadi' });
-
-        console.log(`📩 Kelgan SMS: "${text}"`);
-
-        const cleanText = text.replace(/[\s,]/g, '');
-        const match = cleanText.match(/(\d+)(sum|сум)/i);
-
-        if (!match) {
-            return res.status(400).json({ error: 'SMS dan summani aniqlab boʻlmadi' });
-        }
-
-        const incomingAmount = parseInt(match[1], 10);
-        console.log(`💰 Aniqlangan summa: ${incomingAmount} so'm`);
-
-        // Шаг 1: Ищем точное совпадение по сумме в активных заказах за последние 15 минут
-        let orders = queryToObjects(`
-            SELECT * FROM orders 
-            WHERE amount = ${incomingAmount} AND status = 'PENDING' 
-            AND datetime(created_at) >= datetime('now', '-15 minutes')
-            ORDER BY id DESC LIMIT 1
-        `);
-
-        // Шаг 2: Если точного совпадения нет, включаем поиск по диапазону (+/- 100 сум)
-        if (orders.length === 0) {
-            const minAmount = incomingAmount - 100;
-            const maxAmount = incomingAmount + 100;
-            orders = queryToObjects(`
-                SELECT * FROM orders 
-                WHERE amount BETWEEN ${minAmount} AND${maxAmount} AND status = 'PENDING' 
-                AND datetime(created_at) >= datetime('now', '-10 minutes')
-                ORDER BY id DESC LIMIT 1
-            `);
-        }
-
-        if (orders.length === 0) {
-            console.log(`⚠️ Mos keluvchi faol buyurtma topilmadi (${incomingAmount} so'm)`);
-            return res.status(404).json({ error: 'Mos buyurtma topilmadi' });
-        }
-
-        const order = orders[0];
-
-        // Подтверждаем заказ и начисляем монеты
-        db.run(`UPDATE orders SET status = 'PAID' WHERE id = ${order.id}`);
-        addCoins(order.user_id, order.coins, `To'lov tasdiqlandi: ${order.amount} so'm`);
-
-        console.log(`✅ To'lov muvaffaqiyatli bajarildi! Foydalanuvchi ID: ${order.user_id} \vert{} +${order.coins} tanga`);
-        return res.json({ success: true, userId: order.user_id, coinsAdded: order.coins });
-    } catch (error) {
-        console.error('Webhook SMS error:', error);
-        return res.status(500).json({ error: 'Server xatosi' });
-    }
-});
+app.use('/api', createPaymentsRouter());
 
 // ============================================================
 // API: Конвертация файлов (Fayl Konverter)
@@ -509,36 +401,18 @@ app.post('/api/convert-file', upload.array('files', 10), async (req, res) => {
 // ============================================================
 // API: Кошелек и Баланс
 // ============================================================
-app.get('/api/wallet/:userId', (req, res) => {
+// Баланс виден только владельцу. Эндпоинты /api/wallet/add-coins и /api/wallet/spend-coins
+// удалены: add-coins позволял любому без авторизации начислить себе сколько угодно монет.
+// Монеты начисляются только через подтверждённую оплату (см. payments.js).
+app.get('/api/wallet/:userId', requireAuth, requireSelf, (req, res) => {
     try {
-        const userId = parseInt(req.params.userId) || 1;
+        const userId = req.user.id;
         const stats = getStats(userId);
         const transactions = getTransactions(userId, 10);
         res.json({ ...stats, transactions });
     } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/wallet/add-coins', (req, res) => {
-    try {
-        const { userId, amount, package: pkg } = req.body;
-        const uid = parseInt(userId) || 1;
-        const newBalance = addCoins(uid, amount, `Пакет: ${pkg} монет`);
-        res.json({ success: true, coins: newBalance, message: `✅ ${amount} tanga qo'shildi!` });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/wallet/spend-coins', (req, res) => {
-    try {
-        const { userId, amount, description } = req.body;
-        const uid = parseInt(userId) || 1;
-        const newBalance = spendCoins(uid, amount, description);
-        res.json({ success: true, coins: newBalance });
-    } catch (error) {
-        res.status(400).json({ error: error.message });
+        console.error('Wallet error:', error);
+        res.status(500).json({ error: 'Server xatosi' });
     }
 });
 
@@ -630,12 +504,21 @@ app.post('/api/check-grammar', async (req, res) => {
     }
 });
 
-app.post('/api/check-file', upload.single('document'), async (req, res) => {
+app.post('/api/check-file', requireAuth, upload.single('document'), async (req, res) => {
+    const userId = req.user.id;
+    let spentPages = 0;
+
     try {
         if (!req.file) return res.status(400).json({ error: 'Fayl yuklanmadi' });
-        const userId = parseInt(req.body.userId) || parseInt(req.query.userId) || 1;
         const fileName = req.file.originalname.toLowerCase();
         const inputBuffer = req.file.buffer;
+
+        // Формат проверяем ДО списания монет
+        const isDocx = fileName.endsWith('.docx');
+        const isTextLike = fileName.endsWith('.txt') || fileName.endsWith('.pdf') || fileName.endsWith('.doc');
+        if (!isDocx && !isTextLike) {
+            return res.status(400).json({ error: 'Faqat .docx, .doc, .txt, .pdf formatlari qoʻllab-quvvatlanadi' });
+        }
 
         const pages = await getDocumentPageCount(inputBuffer, req.file.originalname);
         const balance = getBalance(userId);
@@ -646,16 +529,17 @@ app.post('/api/check-file', upload.single('document'), async (req, res) => {
 
         try {
             spendCoins(userId, pages, `Проверка файла: ${req.file.originalname}`);
+            spentPages = pages;
         } catch (err) {
             return res.status(400).json({ error: 'Yetarli tanga yo\'q' });
         }
 
         let outputBuffer, outputFilename, contentType;
-        if (fileName.endsWith('.docx')) {
+        if (isDocx) {
             outputBuffer = await processDocxWithProgress(inputBuffer, () => {});
             outputFilename = `tahrirlangan_${req.file.originalname}`;
             contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-        } else if (fileName.endsWith('.txt') || fileName.endsWith('.pdf') || fileName.endsWith('.doc')) {
+        } else {
             let textContent = '';
             if (fileName.endsWith('.txt')) textContent = inputBuffer.toString('utf-8');
             else if (fileName.endsWith('.pdf')) { const p = await pdfParse(inputBuffer); textContent = p.text; }
@@ -666,15 +550,21 @@ app.post('/api/check-file', upload.single('document'), async (req, res) => {
             outputBuffer = Buffer.from(parsed.cleanText || textContent, 'utf-8');
             outputFilename = `tahrirlangan_${req.file.originalname}.txt`;
             contentType = 'text/plain; charset=utf-8';
-        } else {
-            addCoins(userId, pages, 'Возврат: формат не поддерживается');
-            return res.status(400).json({ error: 'Faqat .docx, .doc, .txt, .pdf formatlari qoʻllab-quvvatlanadi' });
         }
 
         res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(outputFilename)}"`);
         res.send(outputBuffer);
     } catch (error) {
+        console.error('check-file error:', error);
+        // Если монеты уже списали, а результата нет — возвращаем их
+        if (spentPages > 0) {
+            try {
+                refundCoins(userId, spentPages, 'Возврат: ошибка обработки файла');
+            } catch (refundError) {
+                console.error('Refund error:', refundError);
+            }
+        }
         return res.status(500).json({ error: 'Faylni qayta ishlashda xatolik yuz berdi' });
     }
 });
