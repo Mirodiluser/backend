@@ -15,11 +15,31 @@ const { PDFDocument } = require('pdf-lib');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { exec, execSync } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'tahrir_ai_jwt_secret_key_2026';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error('❌ JWT_SECRET .env faylida koʻrsatilmagan');
+    process.exit(1);
+}
+
+const SMS_WEBHOOK_SECRET = process.env.SMS_WEBHOOK_SECRET;
+
+// Сколько минут заказ ждёт оплату (на фронтенде таймер 10 минут + запас на задержку SMS)
+const ORDER_TTL_MINUTES = 15;
+
+// Tanga paketlari: narx va tangalar faqat serverda belgilanadi
+const COIN_PACKAGES = {
+    pkg_15: { price: 7990, coins: 15 },
+    pkg_50: { price: 22990, coins: 55 },
+    pkg_100: { price: 42990, coins: 115 },
+    pkg_250: { price: 99990, coins: 290 },
+    pkg_500: { price: 169990, coins: 580 },
+    pkg_1200: { price: 309990, coins: 1150 },
+};
 
 const { 
     initDatabase, 
@@ -31,7 +51,10 @@ const {
     spendCoins, 
     getTransactions, 
     getStats,
-    db // Импортируем объект БД для работы с заказами
+    createOrder,
+    getOrder,
+    findPendingOrders,
+    markOrderPaid
 } = require('./database');
 
 const { fixGrammar, transliterateWithAI } = require('./grammar');
@@ -44,11 +67,36 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Проверка JWT: Authorization: Bearer <token>
+function requireAuth(req, res, next) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Avval tizimga kiring' });
+    try {
+        const payload = jwt.verify(token, JWT_SECRET);
+        req.userId = parseInt(payload.id);
+        if (!req.userId) throw new Error('bad token');
+        return next();
+    } catch (e) {
+        return res.status(401).json({ error: 'Sessiya muddati tugagan, qaytadan kiring' });
+    }
+}
+
+function safeEqual(a, b) {
+    const bufA = Buffer.from(String(a));
+    const bufB = Buffer.from(String(b));
+    return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+}
+
 // ============================================================
 // Поиск LibreOffice (soffice.exe)
 // ============================================================
 function findLibreOffice() {
-    const possiblePaths = [
+    if (process.env.LIBREOFFICE_PATH && fs.existsSync(process.env.LIBREOFFICE_PATH)) {
+        return process.env.LIBREOFFICE_PATH;
+    }
+
+    const possiblePaths = process.platform === 'win32' ? [
         'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
         'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
         path.join(os.homedir(), 'Desktop', 'LibreOffice', 'program', 'soffice.exe'),
@@ -57,26 +105,68 @@ function findLibreOffice() {
         path.join(os.homedir(), 'OneDrive', 'Рабочий стол', 'LibreOffice', 'program', 'soffice.exe'),
         'D:\\LibreOffice\\program\\soffice.exe',
         'E:\\LibreOffice\\program\\soffice.exe',
+    ] : [
+        '/usr/bin/soffice',
+        '/usr/bin/libreoffice',
+        '/usr/local/bin/soffice',
+        '/usr/lib/libreoffice/program/soffice',
+        '/opt/libreoffice/program/soffice',
+        '/snap/bin/libreoffice',
+        '/Applications/LibreOffice.app/Contents/MacOS/soffice',
     ];
-    
+
     for (const p of possiblePaths) {
         if (fs.existsSync(p)) {
             console.log(`✅ LibreOffice topildi: ${p}`);
             return p;
         }
     }
-    
+
+    const lookup = process.platform === 'win32' ? ['where', ['soffice']] : ['which', ['soffice', 'libreoffice']];
     try {
-        const result = execSync('where soffice', { encoding: 'utf-8' });
-        const paths = result.trim().split('\n');
-        if (paths.length > 0 && paths[0].trim()) {
-            console.log(`✅ LibreOffice topildi (PATH): ${paths[0].trim()}`);
-            return paths[0].trim();
+        const result = execFileSync(lookup[0], lookup[1], { encoding: 'utf-8' });
+        const found = result.trim().split(/\r?\n/)[0];
+        if (found) {
+            console.log(`✅ LibreOffice topildi (PATH): ${found}`);
+            return found.trim();
         }
     } catch (e) {}
-    
-    console.error('❌ LibreOffice (soffice.exe) topilmadi');
+
+    console.error('❌ LibreOffice (soffice) topilmadi');
     return null;
+}
+
+// Конвертация через LibreOffice. Имя файла пользователя не попадает ни в путь, ни в команду.
+async function convertWithLibreOffice(buffer, inputExt, targetExt, extraArgs = [], timeout = 120000) {
+    const libreOfficePath = findLibreOffice();
+    if (!libreOfficePath) throw new Error('LibreOffice topilmadi');
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'convert_'));
+    try {
+        const inputPath = path.join(tempDir, `input${inputExt}`);
+        fs.writeFileSync(inputPath, buffer);
+
+        await new Promise((resolve, reject) => {
+            execFile(
+                libreOfficePath,
+                ['--headless', ...extraArgs, '--convert-to', targetExt, '--outdir', tempDir, inputPath],
+                { timeout },
+                (error) => error ? reject(new Error(`LibreOffice xatosi: ${error.message}`)) : resolve()
+            );
+        });
+
+        const outputPath = path.join(tempDir, `input.${targetExt}`);
+        if (!fs.existsSync(outputPath)) throw new Error(`${targetExt.toUpperCase()} yaratilmadi`);
+        return fs.readFileSync(outputPath);
+    } finally {
+        fs.rm(tempDir, { recursive: true, force: true }, () => {});
+    }
+}
+
+// Безопасный заголовок Content-Disposition (UTF-8 имена файлов)
+function attachmentHeader(filename) {
+    const ascii = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+    return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
 // ============================================================
@@ -204,12 +294,9 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-app.get('/api/auth/me/:userId', (req, res) => {
+app.get('/api/auth/me', requireAuth, (req, res) => {
     try {
-        const userId = parseInt(req.params.userId);
-        if (!userId) return res.status(400).json({ error: 'ID kiritilmadi' });
-
-        const user = getUser(userId);
+        const user = getUser(req.userId);
         if (!user) {
             return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
         }
@@ -228,65 +315,70 @@ app.get('/api/auth/me/:userId', (req, res) => {
 // API: Платежи (Создание заказа, Статус, Вебхук SMS)
 // ============================================================
 
-// Yordamchi funksiya: sql.js natijasini obyektlar massiviga o'tkazish
-function queryToObjects(sqlQuery) {
-    const result = db.exec(sqlQuery);
-    if (result.length === 0) return [];
-    const columns = result[0].columns;
-    return result[0].values.map(row => {
-        const obj = {};
-        columns.forEach((col, idx) => { obj[col] = row[idx]; });
-        return obj;
-    });
-}
-
-// 1. Создание заказа на оплату
-app.post('/api/payment/create-order', (req, res) => {
+// 1. Создание заказа на оплату (сумма и монеты берутся из серверного списка пакетов)
+app.post('/api/payment/create-order', requireAuth, (req, res) => {
     try {
-        const { orderId, userId, packageId, amount, coins } = req.body;
-        if (!orderId || !userId || !amount || !coins) {
-            return res.status(400).json({ error: 'Maʼlumotlar yetarli emas' });
+        const { packageId } = req.body;
+        const pkg = COIN_PACKAGES[packageId];
+        if (!pkg) {
+            return res.status(400).json({ error: 'Paket topilmadi' });
         }
 
-        const pkgId = packageId || 'custom';
-        db.run(`
-            INSERT INTO orders (order_id, user_id, package_id, amount, coins, status, created_at)
-            VALUES ('${orderId}', ${userId}, '${pkgId}', ${amount},${coins}, 'PENDING', datetime('now'))
-        `);
+        // Уникальная сумма: цена пакета минус 1–99 сум, не занятая другим активным заказом
+        const taken = new Set(
+            findPendingOrders(pkg.price - 99, pkg.price - 1, ORDER_TTL_MINUTES).map(o => o.amount)
+        );
+        const free = [];
+        for (let discount = 1; discount <= 99; discount++) {
+            if (!taken.has(pkg.price - discount)) free.push(pkg.price - discount);
+        }
+        if (free.length === 0) {
+            return res.status(503).json({ error: 'Hozir toʻlovlar koʻp, bir necha daqiqadan soʻng urinib koʻring' });
+        }
+        const amount = free[crypto.randomInt(free.length)];
 
-        console.log(`💳 Yangi buyurtma yaratildi: ${orderId} | Summa: ${amount} so'm \vert{} Tanga:${coins}`);
-        return res.json({ success: true, orderId });
+        const orderId = `ord_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        createOrder(orderId, req.userId, packageId, amount, pkg.coins);
+
+        console.log(`💳 Yangi buyurtma yaratildi: ${orderId} | Summa: ${amount} so'm | Tanga: ${pkg.coins}`);
+        return res.json({ success: true, orderId, amount, coins: pkg.coins });
     } catch (error) {
         console.error('Create order error:', error);
         return res.status(500).json({ error: 'Buyurtma yaratishda xatolik' });
     }
 });
 
-// 2. Проверка статуса заказа (для фронтенда в реальном времени)
-app.get('/api/payment/check-status/:orderId', (req, res) => {
+// 2. Проверка статуса заказа (только свой заказ)
+app.get('/api/payment/check-status/:orderId', requireAuth, (req, res) => {
     try {
-        const { orderId } = req.params;
-        const orders = queryToObjects(`SELECT * FROM orders WHERE order_id = '${orderId}' LIMIT 1`);
-
-        if (orders.length === 0) {
-            return res.json({ status: 'PENDING' }); 
+        const order = getOrder(req.params.orderId);
+        if (!order || order.user_id !== req.userId) {
+            return res.status(404).json({ error: 'Buyurtma topilmadi' });
         }
-
-        return res.json({ status: orders[0].status });
+        return res.json({ status: order.status });
     } catch (error) {
         return res.status(500).json({ error: 'Server xatosi' });
     }
 });
 
-// 3. Вебхук для приема SMS от телефона (Автоматическое зачисление + Диапазон + Умный поиск)
+// 3. Вебхук для приема SMS от телефона. Требует секрет: заголовок X-Webhook-Secret или ?secret=
 app.post('/api/webhook/sms', (req, res) => {
     try {
+        if (!SMS_WEBHOOK_SECRET) {
+            console.error('❌ SMS_WEBHOOK_SECRET .env faylida koʻrsatilmagan, webhook oʻchirilgan');
+            return res.status(503).json({ error: 'Webhook sozlanmagan' });
+        }
+        const provided = req.get('x-webhook-secret') || req.query.secret || '';
+        if (!safeEqual(provided, SMS_WEBHOOK_SECRET)) {
+            return res.status(401).json({ error: 'Ruxsat yoʻq' });
+        }
+
         const { text } = req.body;
         if (!text) return res.status(400).json({ error: 'SMS matni topilmadi' });
 
         console.log(`📩 Kelgan SMS: "${text}"`);
 
-        const cleanText = text.replace(/[\s,]/g, '');
+        const cleanText = String(text).replace(/[\s,]/g, '');
         const match = cleanText.match(/(\d+)(sum|сум)/i);
 
         if (!match) {
@@ -296,38 +388,28 @@ app.post('/api/webhook/sms', (req, res) => {
         const incomingAmount = parseInt(match[1], 10);
         console.log(`💰 Aniqlangan summa: ${incomingAmount} so'm`);
 
-        // Шаг 1: Ищем точное совпадение по сумме в активных заказах за последние 15 минут
-        let orders = queryToObjects(`
-            SELECT * FROM orders 
-            WHERE amount = ${incomingAmount} AND status = 'PENDING' 
-            AND datetime(created_at) >= datetime('now', '-15 minutes')
-            ORDER BY id DESC LIMIT 1
-        `);
+        // Шаг 1: точное совпадение (суммы активных заказов уникальны)
+        let candidates = findPendingOrders(incomingAmount, incomingAmount, ORDER_TTL_MINUTES);
 
-        // Шаг 2: Если точного совпадения нет, включаем поиск по диапазону (+/- 100 сум)
-        if (orders.length === 0) {
-            const minAmount = incomingAmount - 100;
-            const maxAmount = incomingAmount + 100;
-            orders = queryToObjects(`
-                SELECT * FROM orders 
-                WHERE amount BETWEEN ${minAmount} AND${maxAmount} AND status = 'PENDING' 
-                AND datetime(created_at) >= datetime('now', '-10 minutes')
-                ORDER BY id DESC LIMIT 1
-            `);
+        // Шаг 2: диапазон +/- 100 сум, но только если подходит ровно один заказ
+        if (candidates.length === 0) {
+            candidates = findPendingOrders(incomingAmount - 100, incomingAmount + 100, ORDER_TTL_MINUTES);
+            if (candidates.length > 1) {
+                console.log(`⚠️ ${incomingAmount} so'm: ${candidates.length} ta mos buyurtma, qoʻlda tekshiring`);
+                return res.status(409).json({ error: 'Bir nechta mos buyurtma, qoʻlda tekshirish kerak' });
+            }
         }
 
-        if (orders.length === 0) {
+        const order = candidates[0];
+        if (!order) {
             console.log(`⚠️ Mos keluvchi faol buyurtma topilmadi (${incomingAmount} so'm)`);
             return res.status(404).json({ error: 'Mos buyurtma topilmadi' });
         }
 
-        const order = orders[0];
-
-        // Подтверждаем заказ и начисляем монеты
-        db.run(`UPDATE orders SET status = 'PAID' WHERE id = ${order.id}`);
+        markOrderPaid(order.id);
         addCoins(order.user_id, order.coins, `To'lov tasdiqlandi: ${order.amount} so'm`);
 
-        console.log(`✅ To'lov muvaffaqiyatli bajarildi! Foydalanuvchi ID: ${order.user_id} \vert{} +${order.coins} tanga`);
+        console.log(`✅ To'lov muvaffaqiyatli bajarildi! Foydalanuvchi ID: ${order.user_id} | +${order.coins} tanga`);
         return res.json({ success: true, userId: order.user_id, coinsAdded: order.coins });
     } catch (error) {
         console.error('Webhook SMS error:', error);
@@ -351,95 +433,27 @@ app.post('/api/convert-file', upload.array('files', 10), async (req, res) => {
         const ext = firstFile.originalname.toLowerCase();
 
         if (targetFormat === 'pdf' && /\.(docx|doc)$/i.test(ext)) {
-            const libreOfficePath = findLibreOffice();
-            if (!libreOfficePath) return res.status(500).json({ error: 'LibreOffice topilmadi' });
-
-            const tempDir = path.join(os.tmpdir(), `convert_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-            fs.mkdirSync(tempDir, { recursive: true });
-
-            const inputPath = path.join(tempDir, firstFile.originalname);
-            fs.writeFileSync(inputPath, firstFile.buffer);
-
             try {
-                const command = `"${libreOfficePath}" --headless --convert-to pdf --outdir "${tempDir}" "${inputPath}"`;
-                await new Promise((resolve, reject) => {
-                    exec(command, { timeout: 120000 }, (error) => {
-                        if (error) reject(new Error(`LibreOffice xatosi: ${error.message}`));
-                        else resolve();
-                    });
-                });
-
+                const pdfBuffer = await convertWithLibreOffice(firstFile.buffer, path.extname(ext), 'pdf');
                 const baseName = path.basename(firstFile.originalname, path.extname(firstFile.originalname));
-                const pdfPath = path.join(tempDir, `${baseName}.pdf`);
-
-                if (!fs.existsSync(pdfPath)) {
-                    const filesInDir = fs.readdirSync(tempDir);
-                    const pdfFile = filesInDir.find(f => f.toLowerCase().endsWith('.pdf'));
-                    if (!pdfFile) throw new Error('PDF yaratilmadi');
-                    
-                    const pdfBuffer = fs.readFileSync(path.join(tempDir, pdfFile));
-                    setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {} }, 3000);
-                    
-                    res.setHeader('Content-Type', 'application/pdf');
-                    res.setHeader('Content-Disposition', `attachment; filename="${pdfFile}"`);
-                    return res.send(pdfBuffer);
-                }
-
-                const pdfBuffer = fs.readFileSync(pdfPath);
-                setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {} }, 3000);
-
                 res.setHeader('Content-Type', 'application/pdf');
-                res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}.pdf"`);
+                res.setHeader('Content-Disposition', attachmentHeader(`${baseName}.pdf`));
                 return res.send(pdfBuffer);
             } catch (err) {
-                setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {} }, 5000);
+                console.error('DOC->PDF error:', err.message);
                 return res.status(500).json({ error: 'PDF ga o\'girishda xatolik' });
             }
         }
 
         if (targetFormat === 'docx' && ext.endsWith('.pdf')) {
-            const libreOfficePath = findLibreOffice();
-            if (!libreOfficePath) return res.status(500).json({ error: 'LibreOffice topilmadi' });
-
-            const tempDir = path.join(os.tmpdir(), `convert_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-            fs.mkdirSync(tempDir, { recursive: true });
-
-            const inputPath = path.join(tempDir, firstFile.originalname);
-            fs.writeFileSync(inputPath, firstFile.buffer);
-
             try {
-                const command = `"${libreOfficePath}" --headless --infilter="writer_pdf_import" --convert-to docx --outdir "${tempDir}" "${inputPath}"`;
-                await new Promise((resolve, reject) => {
-                    exec(command, { timeout: 180000 }, (error) => {
-                        if (error) reject(new Error(`LibreOffice xatosi: ${error.message}`));
-                        else resolve();
-                    });
-                });
-
-                const baseName = path.basename(firstFile.originalname, '.pdf');
-                const docxPath = path.join(tempDir, `${baseName}.docx`);
-
-                if (!fs.existsSync(docxPath)) {
-                    const filesInDir = fs.readdirSync(tempDir);
-                    const docxFile = filesInDir.find(f => f.toLowerCase().endsWith('.docx'));
-                    if (!docxFile) throw new Error('DOCX yaratilmadi');
-                    
-                    const docxBuffer = fs.readFileSync(path.join(tempDir, docxFile));
-                    setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {} }, 3000);
-                    
-                    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-                    res.setHeader('Content-Disposition', `attachment; filename="${docxFile}"`);
-                    return res.send(docxBuffer);
-                }
-
-                const docxBuffer = fs.readFileSync(docxPath);
-                setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {} }, 3000);
-
+                const docxBuffer = await convertWithLibreOffice(firstFile.buffer, '.pdf', 'docx', ['--infilter=writer_pdf_import'], 180000);
+                const baseName = path.basename(firstFile.originalname, path.extname(firstFile.originalname));
                 res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-                res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}.docx"`);
+                res.setHeader('Content-Disposition', attachmentHeader(`${baseName}.docx`));
                 return res.send(docxBuffer);
             } catch (err) {
-                setTimeout(() => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {} }, 5000);
+                console.error('PDF->DOCX error:', err.message);
                 return res.status(500).json({ error: 'PDF ni DOCX ga o\'girishda xatolik' });
             }
         }
@@ -449,7 +463,7 @@ app.post('/api/convert-file', upload.array('files', 10), async (req, res) => {
                 const pdfData = await pdfParse(firstFile.buffer);
                 const baseName = path.basename(firstFile.originalname, '.pdf');
                 res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-                res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}.txt"`);
+                res.setHeader('Content-Disposition', attachmentHeader(`${baseName}.txt`));
                 return res.send(Buffer.from(pdfData.text, 'utf-8'));
             } catch (err) {
                 return res.status(500).json({ error: 'PDF ni TXT ga o\'girishda xatolik' });
@@ -468,7 +482,7 @@ app.post('/api/convert-file', upload.array('files', 10), async (req, res) => {
                 }
                 const baseName = path.basename(firstFile.originalname, path.extname(firstFile.originalname));
                 res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-                res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}.txt"`);
+                res.setHeader('Content-Disposition', attachmentHeader(`${baseName}.txt`));
                 return res.send(Buffer.from(text, 'utf-8'));
             } catch (err) {
                 return res.status(500).json({ error: 'Faylni TXT ga o\'girishda xatolik' });
@@ -509,36 +523,13 @@ app.post('/api/convert-file', upload.array('files', 10), async (req, res) => {
 // ============================================================
 // API: Кошелек и Баланс
 // ============================================================
-app.get('/api/wallet/:userId', (req, res) => {
+app.get('/api/wallet', requireAuth, (req, res) => {
     try {
-        const userId = parseInt(req.params.userId) || 1;
-        const stats = getStats(userId);
-        const transactions = getTransactions(userId, 10);
+        const stats = getStats(req.userId);
+        const transactions = getTransactions(req.userId, 10);
         res.json({ ...stats, transactions });
     } catch (error) {
         res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/wallet/add-coins', (req, res) => {
-    try {
-        const { userId, amount, package: pkg } = req.body;
-        const uid = parseInt(userId) || 1;
-        const newBalance = addCoins(uid, amount, `Пакет: ${pkg} монет`);
-        res.json({ success: true, coins: newBalance, message: `✅ ${amount} tanga qo'shildi!` });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/wallet/spend-coins', (req, res) => {
-    try {
-        const { userId, amount, description } = req.body;
-        const uid = parseInt(userId) || 1;
-        const newBalance = spendCoins(uid, amount, description);
-        res.json({ success: true, coins: newBalance });
-    } catch (error) {
-        res.status(400).json({ error: error.message });
     }
 });
 
@@ -630,12 +621,17 @@ app.post('/api/check-grammar', async (req, res) => {
     }
 });
 
-app.post('/api/check-file', upload.single('document'), async (req, res) => {
+app.post('/api/check-file', requireAuth, upload.single('document'), async (req, res) => {
+    let charged = 0;
+    const userId = req.userId;
     try {
         if (!req.file) return res.status(400).json({ error: 'Fayl yuklanmadi' });
-        const userId = parseInt(req.body.userId) || parseInt(req.query.userId) || 1;
         const fileName = req.file.originalname.toLowerCase();
         const inputBuffer = req.file.buffer;
+
+        if (!/\.(docx|doc|txt|pdf)$/.test(fileName)) {
+            return res.status(400).json({ error: 'Faqat .docx, .doc, .txt, .pdf formatlari qoʻllab-quvvatlanadi' });
+        }
 
         const pages = await getDocumentPageCount(inputBuffer, req.file.originalname);
         const balance = getBalance(userId);
@@ -646,6 +642,7 @@ app.post('/api/check-file', upload.single('document'), async (req, res) => {
 
         try {
             spendCoins(userId, pages, `Проверка файла: ${req.file.originalname}`);
+            charged = pages;
         } catch (err) {
             return res.status(400).json({ error: 'Yetarli tanga yo\'q' });
         }
@@ -655,7 +652,7 @@ app.post('/api/check-file', upload.single('document'), async (req, res) => {
             outputBuffer = await processDocxWithProgress(inputBuffer, () => {});
             outputFilename = `tahrirlangan_${req.file.originalname}`;
             contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-        } else if (fileName.endsWith('.txt') || fileName.endsWith('.pdf') || fileName.endsWith('.doc')) {
+        } else {
             let textContent = '';
             if (fileName.endsWith('.txt')) textContent = inputBuffer.toString('utf-8');
             else if (fileName.endsWith('.pdf')) { const p = await pdfParse(inputBuffer); textContent = p.text; }
@@ -666,15 +663,16 @@ app.post('/api/check-file', upload.single('document'), async (req, res) => {
             outputBuffer = Buffer.from(parsed.cleanText || textContent, 'utf-8');
             outputFilename = `tahrirlangan_${req.file.originalname}.txt`;
             contentType = 'text/plain; charset=utf-8';
-        } else {
-            addCoins(userId, pages, 'Возврат: формат не поддерживается');
-            return res.status(400).json({ error: 'Faqat .docx, .doc, .txt, .pdf formatlari qoʻllab-quvvatlanadi' });
         }
 
         res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+        res.setHeader('Content-Disposition', attachmentHeader(outputFilename));
         res.send(outputBuffer);
     } catch (error) {
+        console.error('Check file error:', error);
+        if (charged > 0) {
+            try { addCoins(userId, charged, 'Возврат: ошибка обработки файла'); } catch (e) {}
+        }
         return res.status(500).json({ error: 'Faylni qayta ishlashda xatolik yuz berdi' });
     }
 });
