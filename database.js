@@ -230,10 +230,11 @@ function getOrderWithAge(orderId) {
     );
 }
 
-// Ожидающие заказы на сумму в диапазоне [min, max] за последние N секунд
+// Ожидающие заказы на сумму в диапазоне [min, max] младше N секунд.
+// Строгое «>» согласовано с check-status: заказ возрастом ровно N секунд уже EXPIRED и не принимает платёж.
 function findPendingOrders(minAmount, maxAmount, seconds) {
     return all(
-        "SELECT * FROM orders WHERE amount BETWEEN ? AND ? AND status = 'PENDING' AND datetime(created_at) >= datetime('now', ?) ORDER BY id DESC",
+        "SELECT * FROM orders WHERE amount BETWEEN ? AND ? AND status = 'PENDING' AND datetime(created_at) > datetime('now', ?) ORDER BY id DESC",
         [minAmount, maxAmount, `-${parseInt(seconds)} seconds`]
     );
 }
