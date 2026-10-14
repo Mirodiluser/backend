@@ -27,7 +27,7 @@ async function startServer(extraEnv = {}) {
         PORT: String(port),
         DB_PATH: path.join(dir, 'test.db'),
         JWT_SECRET: 'test-jwt-secret',
-        WEBHOOK_SECRET: 'test-hook-secret',
+        SMS_WEBHOOK_SECRET: 'test-hook-secret',
         ...extraEnv
     };
     for (const key of Object.keys(env)) {

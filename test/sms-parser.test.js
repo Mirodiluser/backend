@@ -1,9 +1,6 @@
-process.env.JWT_SECRET = 'test-jwt-secret';
-process.env.DB_PATH = require('node:os').tmpdir() + '/sms-parser-unused.db';
-
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseSmsAmount } = require('../payments');
+const { parseSmsAmount } = require('../sms');
 
 test('parseSmsAmount: разные форматы сумм', () => {
     const cases = [
