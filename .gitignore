@@ -1,1 +1,7 @@
+<<<<<<< HEAD
 .env
+=======
+node_modules/
+.env
+users.db
+>>>>>>> 775d4d4b1300d79e9e6693ebb4b29413cb4a3290
