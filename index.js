@@ -631,6 +631,17 @@ app.post('/api/check-grammar', async (req, res) => {
 app.post('/api/check-file', requireAuth, upload.single('document'), async (req, res) => {
     let charged = 0;
     const userId = req.userId;
+    // Возврат монет ровно один раз (ошибка обработки или обрыв соединения с клиентом)
+    const refund = (reason) => {
+        if (charged <= 0) return;
+        const amount = charged;
+        charged = 0;
+        try { addCoins(userId, amount, reason); } catch (e) { console.error('Refund error:', e); }
+    };
+    // Если клиент оборвал соединение (сеть приостановлена, вкладка закрыта), результат он не получит
+    res.on('close', () => {
+        if (!res.writableFinished) refund('Возврат: соединение прервано');
+    });
     try {
         if (!req.file) return res.status(400).json({ error: 'Fayl yuklanmadi' });
         const fileName = req.file.originalname.toLowerCase();
@@ -677,9 +688,7 @@ app.post('/api/check-file', requireAuth, upload.single('document'), async (req, 
         res.send(outputBuffer);
     } catch (error) {
         console.error('Check file error:', error);
-        if (charged > 0) {
-            try { addCoins(userId, charged, 'Возврат: ошибка обработки файла'); } catch (e) {}
-        }
+        refund('Возврат: ошибка обработки файла');
         return res.status(500).json({ error: 'Faylni qayta ishlashda xatolik yuz berdi' });
     }
 });
