@@ -299,6 +299,8 @@ async function processDocxWithProgress(fileBuffer, onProgressUpdate) {
 
         } catch (error) {
             console.error(`Ошибка при обработке пакета абзацев ${i}-${i + BATCH_SIZE}:`, error.message);
+            // Сбой AI нельзя скрывать: иначе пользователь получит файл без проверки
+            if (error.aiFailure) throw error;
         }
 
         const currentBatchNum = Math.floor(i / BATCH_SIZE) + 1;

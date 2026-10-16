@@ -624,7 +624,8 @@ app.post('/api/check-grammar', async (req, res) => {
         const result = await fixGrammar(text);
         return res.json({ result });
     } catch (error) {
-        return res.status(500).json({ error: 'Ошибка проверки грамматики' });
+        console.error('check-grammar error:', error);
+        return res.status(503).json({ error: "Imlo tekshiruvi xizmati hozir ishlamayapti. Keyinroq urinib ko'ring." });
     }
 });
 
@@ -689,6 +690,9 @@ app.post('/api/check-file', requireAuth, upload.single('document'), async (req, 
     } catch (error) {
         console.error('Check file error:', error);
         refund('Возврат: ошибка обработки файла');
+        if (error.aiFailure) {
+            return res.status(503).json({ error: "Imlo tekshiruvi xizmati hozir ishlamayapti. Tangalar qaytarildi, keyinroq urinib ko'ring." });
+        }
         return res.status(500).json({ error: 'Faylni qayta ishlashda xatolik yuz berdi' });
     }
 });

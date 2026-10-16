@@ -1,6 +1,10 @@
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+if (!process.env.GEMINI_API_KEY) {
+    console.error('❌ GEMINI_API_KEY .env faylida koʻrsatilmagan: imlo tekshiruvi ishlamaydi');
+}
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const modelText = genAI.getGenerativeModel({
@@ -281,7 +285,9 @@ Text: "${text}"
 
     } catch (e) {
         console.error("fixGrammar xatosi:", e);
-        return JSON.stringify({ hasErrors: false, message: "❌ Tekshirishda xatolik yuz berdi.", cleanText: text });
+        // Не маскируем сбой AI под «ошибок нет»: вызывающий код сообщит пользователю и вернёт монеты
+        e.aiFailure = true;
+        throw e;
     }
 }
 
@@ -376,7 +382,10 @@ ${JSON.stringify(textArray, null, 2)}
         }
     }
     
-    return textArray.map(() => ({ wrongWords: [] }));
+    // Все попытки не удались: это сбой AI, а не «ошибок нет»
+    const err = new Error('Gemini javob bermadi (kalit, kvota yoki model nomini tekshiring)');
+    err.aiFailure = true;
+    throw err;
 }
 
 /**
